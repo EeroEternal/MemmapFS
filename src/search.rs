@@ -151,7 +151,7 @@ impl SearchProvider {
         for (score, doc_addr) in top_docs {
             let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
             if let Some(key_val) = retrieved.get_first(self.field_key) {
-                if let Some(key) = key_val.as_text() {
+                if let Some(key) = key_val.as_str() {
                     hits.push(Hit {
                         key: key.to_string(),
                         score,
