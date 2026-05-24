@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,13 @@ pub enum WalCommand {
     SetKv { key: String, value: Vec<u8> },
     /// A key was removed from the KV store.
     DeleteKv { key: String },
+    /// A stream chunk was appended.
+    AppendStream {
+        key: String,
+        chunk_id: u32,
+        offset: u64,
+        length: u64,
+    },
 }
 
 /// Manages sequential, append-only binary writes to `state.wal` and provides
@@ -60,6 +69,7 @@ impl LogManager {
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&payload)?;
         self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
         Ok(())
     }
 
@@ -123,6 +133,10 @@ pub struct BlockStorage {
     /// Write cursor position inside the active chunk.
     active_offset: u64,
     writer: BufWriter<File>,
+    /// Reader for the active chunk.
+    active_reader: Mutex<File>,
+    /// Cache of memory-mapped immutable chunks.
+    mmap_cache: Mutex<HashMap<u32, Arc<Mmap>>>,
 }
 
 impl BlockStorage {
@@ -140,18 +154,15 @@ impl BlockStorage {
             .create(true)
             .append(true)
             .open(&chunk_path)?;
-        let active_offset = if active_offset == 0 {
-            // freshly created file
-            0
-        } else {
-            active_offset
-        };
+        let active_reader = File::open(&chunk_path)?;
 
         Ok(Self {
             blocks_dir,
             active_chunk_id,
             active_offset,
             writer: BufWriter::new(file),
+            active_reader: Mutex::new(active_reader),
+            mmap_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -173,26 +184,46 @@ impl BlockStorage {
         Ok((self.active_chunk_id, offset, data.len() as u64))
     }
 
-    /// Reads `length` bytes from `chunk_id` at `offset` using a zero-copy
-    /// memory mapping and returns the bytes as an owned `Vec<u8>`.
+    /// Reads `length` bytes from `chunk_id` at `offset`.
+    ///
+    /// For historical/immutable chunks, uses cached memory mappings.
+    /// For the active chunk, performs a standard thread-safe read from the active file reader.
     pub fn read(&self, chunk_id: u32, offset: u64, length: u64) -> Result<Vec<u8>, MemMapError> {
-        let path = Self::chunk_path(&self.blocks_dir, chunk_id);
-        if !path.exists() {
+        if chunk_id > self.active_chunk_id {
             return Err(MemMapError::BlockNotFound { chunk_id, offset });
         }
 
-        let file = File::open(&path)?;
-        // SAFETY: The file is opened read-only and no other thread holds a
-        // mutable mapping to the same range.  We copy out of the mapping
-        // immediately, which is safe even if the underlying file is later
-        // appended to.
-        let mmap = unsafe { Mmap::map(&file)? };
-        let start = offset as usize;
-        let end = start + length as usize;
-        if end > mmap.len() {
-            return Err(MemMapError::BlockNotFound { chunk_id, offset });
+        if chunk_id == self.active_chunk_id {
+            let mut reader = self.active_reader.lock().unwrap();
+            if offset + length > self.active_offset {
+                return Err(MemMapError::BlockNotFound { chunk_id, offset });
+            }
+            reader.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; length as usize];
+            reader.read_exact(&mut buf)?;
+            Ok(buf)
+        } else {
+            let mmap = {
+                let mut cache = self.mmap_cache.lock().unwrap();
+                if !cache.contains_key(&chunk_id) {
+                    let path = Self::chunk_path(&self.blocks_dir, chunk_id);
+                    if !path.exists() {
+                        return Err(MemMapError::BlockNotFound { chunk_id, offset });
+                    }
+                    let file = File::open(&path)?;
+                    let mmap = unsafe { Mmap::map(&file)? };
+                    cache.insert(chunk_id, Arc::new(mmap));
+                }
+                cache.get(&chunk_id).unwrap().clone()
+            };
+
+            let start = offset as usize;
+            let end = start + length as usize;
+            if end > mmap.len() {
+                return Err(MemMapError::BlockNotFound { chunk_id, offset });
+            }
+            Ok(mmap[start..end].to_vec())
         }
-        Ok(mmap[start..end].to_vec())
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -202,8 +233,11 @@ impl BlockStorage {
         self.active_chunk_id += 1;
         self.active_offset = 0;
         let path = Self::chunk_path(&self.blocks_dir, self.active_chunk_id);
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         self.writer = BufWriter::new(file);
+
+        let reader = File::open(&path)?;
+        *self.active_reader.lock().unwrap() = reader;
         Ok(())
     }
 

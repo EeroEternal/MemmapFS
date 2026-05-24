@@ -27,6 +27,14 @@ pub struct AgentState {
     pub extra: HashMap<String, String>,
 }
 
+/// A segment of data in a custom stream key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSegment {
+    pub chunk_id: u32,
+    pub offset: u64,
+    pub length: u64,
+}
+
 // ─── MemMapEngine ─────────────────────────────────────────────────────────────
 
 /// In-memory index and KV store reconstructed from WAL replay on startup and
@@ -39,6 +47,8 @@ pub struct MemMapEngine {
     pub metadata_index: BTreeMap<u64, MemoryMetadata>,
     /// Arbitrary binary key/value store.
     pub kv_store: HashMap<String, Vec<u8>>,
+    /// Map from stream key to list of block storage segments.
+    pub streams: HashMap<String, Vec<StreamSegment>>,
     /// Broadcast channel for [`AgentState`] updates.
     state_tx: watch::Sender<AgentState>,
     /// Monotonic counter used to assign unique IDs to new memories.
@@ -53,6 +63,7 @@ impl MemMapEngine {
         let engine = Self {
             metadata_index: BTreeMap::new(),
             kv_store: HashMap::new(),
+            streams: HashMap::new(),
             state_tx,
             next_id: 1,
         };
@@ -93,6 +104,21 @@ impl MemMapEngine {
                 }
                 WalCommand::DeleteKv { key } => {
                     self.kv_store.remove(key);
+                }
+                WalCommand::AppendStream {
+                    key,
+                    chunk_id,
+                    offset,
+                    length,
+                } => {
+                    self.streams
+                        .entry(key.clone())
+                        .or_default()
+                        .push(StreamSegment {
+                            chunk_id: *chunk_id,
+                            offset: *offset,
+                            length: *length,
+                        });
                 }
             }
         }
