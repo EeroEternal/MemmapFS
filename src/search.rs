@@ -66,7 +66,7 @@ impl SearchProvider {
     /// Commits after every document is not optimal for bulk ingestion but
     /// guarantees that the document is searchable straight away, which matches
     /// the low-latency requirements of the MemMapFS write path.
-    pub async fn index_memory(
+    pub fn index_memory(
         &self,
         id: u64,
         text: &str,
@@ -112,7 +112,7 @@ impl SearchProvider {
     }
 
     /// Deletes all documents for `id` from the index and commits.
-    pub async fn delete_memory(&self, id: u64) -> Result<(), MemMapError> {
+    pub fn delete_memory(&self, id: u64) -> Result<(), MemMapError> {
         use tantivy::Term;
         let mut writer = self.writer.lock().unwrap();
         let term = Term::from_field_u64(self.field_id, id);
@@ -122,7 +122,7 @@ impl SearchProvider {
     }
 
     /// Indexes a document with a custom key and text.
-    pub async fn index(&self, key: &str, text: &str) -> Result<(), MemMapError> {
+    pub fn index(&self, key: &str, text: &str) -> Result<(), MemMapError> {
         let mut writer = self.writer.lock().unwrap();
         writer.add_document(doc!(
             self.field_key => key,

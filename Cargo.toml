@@ -1,6 +1,6 @@
 [package]
 name = "memmap_fs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A database-less, zero-daemon, local-first memory and state synchronization file system for AI Agents"
 license = "MIT"

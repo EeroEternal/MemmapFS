@@ -36,16 +36,15 @@ impl MemMapFS {
     /// 2. Opens `LogManager`, `BlockStorage`, and `SearchProvider`.
     /// 3. Replays every `WalCommand` in `state.wal` to rebuild the engine.
     /// 4. Returns the fully initialized handle.
-    pub async fn init<P: Into<PathBuf>>(root: P) -> Result<Self, MemMapError> {
+    pub fn init<P: Into<PathBuf>>(root: P) -> Result<Self, MemMapError> {
         let root_dir: PathBuf = root.into();
 
         // 1. Ensure the directory layout exists.
-        tokio::fs::create_dir_all(&root_dir).await?;
-        tokio::fs::create_dir_all(root_dir.join("index")).await?;
-        tokio::fs::create_dir_all(root_dir.join("blocks")).await?;
+        std::fs::create_dir_all(&root_dir)?;
+        std::fs::create_dir_all(root_dir.join("index"))?;
+        std::fs::create_dir_all(root_dir.join("blocks"))?;
 
-        // 2. Open storage components (blocking I/O run on the current thread
-        //    during init is acceptable; use spawn_blocking for hot paths).
+        // 2. Open storage components.
         let log_manager = LogManager::open(&root_dir)?;
         let block_storage = BlockStorage::open(&root_dir)?;
         let search_provider = SearchProvider::open(&root_dir)?;
@@ -69,7 +68,7 @@ impl MemMapFS {
     /// persists the operation to the WAL atomically.
     ///
     /// Returns the unique ID assigned to this memory entry.
-    pub async fn append_memory(&self, text: &str, tags: Vec<String>) -> Result<u64, MemMapError> {
+    pub fn append_memory(&self, text: &str, tags: Vec<String>) -> Result<u64, MemMapError> {
         // Allocate an ID before acquiring the storage locks so that we hold
         // the engine write-lock for the shortest possible time.
         let id = {
@@ -111,14 +110,14 @@ impl MemMapFS {
 
         // Index the text in Tantivy (after WAL commit so the operation is
         // already durable if the indexer crashes).
-        self.search_provider.index_memory(id, text, &tags).await?;
+        self.search_provider.index_memory(id, text, &tags)?;
 
         Ok(id)
     }
 
     /// Searches memories using Tantivy full-text search and returns the
     /// matching text values read via zero-copy `memmap2`.
-    pub async fn query_memory(&self, query: &str) -> Result<Vec<String>, MemMapError> {
+    pub fn query_memory(&self, query: &str) -> Result<Vec<String>, MemMapError> {
         const MAX_RESULTS: usize = 20;
 
         let ids = self.search_provider.search(query, MAX_RESULTS)?;
@@ -143,7 +142,7 @@ impl MemMapFS {
 
     /// Broadcasts `state` to all Tokio watch subscribers and records it in
     /// the engine so that new subscribers see the latest value immediately.
-    pub async fn update_state(&self, state: AgentState) -> Result<(), MemMapError> {
+    pub fn update_state(&self, state: AgentState) -> Result<(), MemMapError> {
         let eng = self.engine.write().unwrap();
         eng.broadcast_state(state)
     }
@@ -161,7 +160,7 @@ impl MemMapFS {
     }
 
     /// Sets the value for `key` in the KV store, persisting to WAL first.
-    pub async fn set_kv(&self, key: String, value: Vec<u8>) -> Result<(), MemMapError> {
+    pub fn set_kv(&self, key: String, value: Vec<u8>) -> Result<(), MemMapError> {
         let cmd = WalCommand::SetKv {
             key: key.clone(),
             value: value.clone(),
@@ -183,7 +182,7 @@ impl MemMapFS {
     }
 
     /// Deletes `key` from the KV store, persisting to WAL first.
-    pub async fn delete_kv(&self, key: String) -> Result<(), MemMapError> {
+    pub fn delete_kv(&self, key: String) -> Result<(), MemMapError> {
         let cmd = WalCommand::DeleteKv { key: key.clone() };
 
         // Persist the WAL entry first.
@@ -201,70 +200,10 @@ impl MemMapFS {
         Ok(())
     }
 
-    /// The root directory this instance is backed by.
-    pub fn root_dir(&self) -> &PathBuf {
-        &self.root_dir
-    }
-
-    // ─── IntentLoop Metadata APIs ─────────────────────────────────────────────
-
-    /// Writes a session to the KV store.
-    pub async fn put_session(&self, session: &Session) -> Result<(), MemMapError> {
-        let key = format!("sessions/{}", session.id);
-        let bytes = bincode::serialize(session)?;
-        self.set_kv(key, bytes).await
-    }
-
-    /// Reads a session from the KV store.
-    pub fn get_session(&self, id: &str) -> Result<Option<Session>, MemMapError> {
-        let key = format!("sessions/{}", id);
-        if let Some(bytes) = self.get_kv(&key) {
-            let session = bincode::deserialize(&bytes)?;
-            Ok(Some(session))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Lists sessions ordered by `created_at` descending, up to `limit`.
-    pub fn list_sessions(&self, limit: usize) -> Result<Vec<Session>, MemMapError> {
-        let eng = self.engine.read().unwrap();
-        let mut sessions = Vec::new();
-        for (key, val) in &eng.kv_store {
-            if key.starts_with("sessions/") {
-                if let Ok(session) = bincode::deserialize::<Session>(val) {
-                    sessions.push(session);
-                }
-            }
-        }
-        // Sort descending by created_at
-        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        sessions.truncate(limit);
-        Ok(sessions)
-    }
-
-    /// Lists sessions filtered by intent_id.
-    pub fn list_by_intent(&self, intent_id: &str) -> Result<Vec<Session>, MemMapError> {
-        let eng = self.engine.read().unwrap();
-        let mut sessions = Vec::new();
-        for (key, val) in &eng.kv_store {
-            if key.starts_with("sessions/") {
-                if let Ok(session) = bincode::deserialize::<Session>(val) {
-                    if session.intent_id == intent_id {
-                        sessions.push(session);
-                    }
-                }
-            }
-        }
-        // Sort descending by created_at for consistency
-        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        Ok(sessions)
-    }
-
     // ─── IntentLoop Streaming APIs ────────────────────────────────────────────
 
     /// Appends `data` to the stream identified by `key`.
-    pub async fn append_stream(&self, key: &str, data: &[u8]) -> Result<(), MemMapError> {
+    pub fn append_stream(&self, key: &str, data: &[u8]) -> Result<(), MemMapError> {
         // Write raw bytes to block store
         let (chunk_id, offset, length) = {
             let mut store = self.block_storage.write().unwrap();
@@ -317,23 +256,19 @@ impl MemMapFS {
     // ─── IntentLoop Search APIs ───────────────────────────────────────────────
 
     /// Indexes a custom key and text in the full-text search engine.
-    pub async fn index(&self, key: &str, text: &str) -> Result<(), MemMapError> {
-        self.search_provider.index(key, text).await
+    pub fn index(&self, key: &str, text: &str) -> Result<(), MemMapError> {
+        self.search_provider.index(key, text)
     }
 
     /// Searches the full-text index and returns matching hits.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<crate::search::Hit>, MemMapError> {
         self.search_provider.search_hits(query, limit)
     }
-}
 
-/// Represents session tracking metadata for IntentLoop.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct Session {
-    pub id: String,
-    pub intent_id: String,
-    pub created_at: u64, // Unix timestamp
-    pub payload: Vec<u8>,
+    /// The root directory this instance is backed by.
+    pub fn root_dir(&self) -> &PathBuf {
+        &self.root_dir
+    }
 }
 
 /// A reader that implements `std::io::Read` to stream segments of block storage sequentially.
@@ -376,3 +311,4 @@ impl std::io::Read for StreamReader {
         Ok(bytes.len())
     }
 }
+// Force rebuild comment
